@@ -32,13 +32,13 @@
 #undef recvfrom
 #endif
 
-static struct in_addr service_address_ipv4[32];
-static struct in_addr service_mask_ipv4[32];
-static struct in6_addr service_address_ipv6[32];
-static struct in6_addr service_mask_ipv6[32];
-
-static int count_ipv4;
-static int count_ipv6;
+typedef struct interface_t {
+    struct interface_t *next;
+    struct sockaddr_in ipv4_addr;
+    struct in_addr ipv4_mask;
+    struct sockaddr_in6 ipv6_addr;
+    struct in6_addr ipv6_mask;
+} interface_t;
 
 // Data for our service including the mDNS records
 typedef struct {
@@ -46,14 +46,13 @@ typedef struct {
 	mdns_string_t hostname;
 	mdns_string_t service_instance;
 	mdns_string_t hostname_qualified;
-	struct sockaddr_in address_ipv4;
-	struct sockaddr_in6 address_ipv6;
 	int port;
 	mdns_record_t record_ptr;
 	mdns_record_t record_srv;
 	mdns_record_t record_a;
 	mdns_record_t record_aaaa;
-	mdns_record_t txt_record[2];
+
+	interface_t *intf;
 } service_t;
 
 static mdns_string_t
@@ -107,6 +106,35 @@ ip_address_to_string(char* buffer, size_t capacity, const struct sockaddr* addr,
 	return ipv4_address_to_string(buffer, capacity, (const struct sockaddr_in*)addr, addrlen);
 }
 
+static int mdns_intf_append(service_t* service, interface_t *intf) {
+    if ((NULL == service) || (NULL == intf)) {
+        return -1;
+    }
+    intf->next = service->intf;
+    service->intf = intf;
+    return 0;
+}
+
+static interface_t *mdns_intf_find(service_t* service, const struct sockaddr *addr) {
+    interface_t *ptr;
+    const struct sockaddr_in6 *in6_addr;
+    const struct sockaddr_in *in_addr;
+
+    for (ptr = service->intf; NULL != ptr; ptr = ptr->next) {
+        if (addr->sa_family == AF_INET6) {
+            in6_addr = (struct sockaddr_in6 *)addr;
+            continue;
+        }
+        in_addr = (struct sockaddr_in *)addr;
+        if ((ptr->ipv4_mask.s_addr & in_addr->sin_addr.s_addr)
+         == (ptr->ipv4_mask.s_addr & ptr->ipv4_addr.sin_addr.s_addr)) {
+            break;
+        }
+    }
+
+    return ptr;
+}
+
 // Callback handling questions incoming on service sockets
 static int
 service_callback(int sock, const struct sockaddr* from, size_t addrlen, mdns_entry_type_t entry,
@@ -116,13 +144,10 @@ service_callback(int sock, const struct sockaddr* from, size_t addrlen, mdns_ent
     char addrbuffer[64];
     char namebuffer[256];
     char sendbuffer[1024];
-
-	(void)sizeof(ttl);
-	if (entry != MDNS_ENTRYTYPE_QUESTION)
-		return 0;
+    interface_t *intf;
 
 	const char dns_sd[] = "_services._dns-sd._udp.local.";
-	const service_t* service = (const service_t*)user_data;
+	service_t* service = (service_t*)user_data;
 
 	mdns_string_t fromaddrstr = ip_address_to_string(addrbuffer, sizeof(addrbuffer), from, addrlen);
 
@@ -130,6 +155,11 @@ service_callback(int sock, const struct sockaddr* from, size_t addrlen, mdns_ent
 	mdns_string_t name = mdns_string_extract(data, size, &offset, namebuffer, sizeof(namebuffer));
 
 	const char* record_name = 0;
+
+	(void)sizeof(ttl);
+	if (entry != MDNS_ENTRYTYPE_QUESTION)
+		return 0;
+
 	if (rtype == MDNS_RECORDTYPE_PTR)
 		record_name = "PTR";
 	else if (rtype == MDNS_RECORDTYPE_SRV)
@@ -143,6 +173,12 @@ service_callback(int sock, const struct sockaddr* from, size_t addrlen, mdns_ent
 	else
 		return 0;
 	printf("Query %s %.*s from %.*s\n", record_name, MDNS_STRING_FORMAT(name), MDNS_STRING_FORMAT(fromaddrstr));
+
+	intf = mdns_intf_find(service, from);
+	if (NULL == intf) {
+	    printf("Find interface failed\n");
+	    return 0;
+	}
 
 	if ((name.length == (sizeof(dns_sd) - 1)) &&
 	    (strncmp(name.str, dns_sd, sizeof(dns_sd) - 1) == 0)) {
@@ -191,15 +227,14 @@ service_callback(int sock, const struct sockaddr* from, size_t addrlen, mdns_ent
 			additional[additional_count++] = service->record_srv;
 
 			// A/AAAA records mapping "<hostname>.local." to IPv4/IPv6 addresses
-			if (service->address_ipv4.sin_family == AF_INET)
+			if (intf->ipv4_addr.sin_family == AF_INET) {
+                service->record_a.data.a.addr = intf->ipv4_addr;
 				additional[additional_count++] = service->record_a;
-			if (service->address_ipv6.sin6_family == AF_INET6)
+			}
+			if (intf->ipv6_addr.sin6_family == AF_INET6) {
+                service->record_aaaa.data.aaaa.addr = intf->ipv6_addr;
 				additional[additional_count++] = service->record_aaaa;
-
-			// Add two test TXT records for our service instance name, will be coalesced into
-			// one record with both key-value pair strings by the library
-			additional[additional_count++] = service->txt_record[0];
-			additional[additional_count++] = service->txt_record[1];
+			}
 
 			// Send the answer, unicast or multicast depending on flag in query
 			uint16_t unicast = (rclass & MDNS_UNICAST_RESPONSE);
@@ -233,15 +268,14 @@ service_callback(int sock, const struct sockaddr* from, size_t addrlen, mdns_ent
 			size_t additional_count = 0;
 
 			// A/AAAA records mapping "<hostname>.local." to IPv4/IPv6 addresses
-			if (service->address_ipv4.sin_family == AF_INET)
+			if (intf->ipv4_addr.sin_family == AF_INET) {
+                service->record_a.data.a.addr = intf->ipv4_addr;
 				additional[additional_count++] = service->record_a;
-			if (service->address_ipv6.sin6_family == AF_INET6)
+			}
+			if (intf->ipv6_addr.sin6_family == AF_INET6) {
+                service->record_aaaa.data.aaaa.addr = intf->ipv6_addr;
 				additional[additional_count++] = service->record_aaaa;
-
-			// Add two test TXT records for our service instance name, will be coalesced into
-			// one record with both key-value pair strings by the library
-			additional[additional_count++] = service->txt_record[0];
-			additional[additional_count++] = service->txt_record[1];
+			}
 
 			// Send the answer, unicast or multicast depending on flag in query
 			uint16_t unicast = (rclass & MDNS_UNICAST_RESPONSE);
@@ -261,7 +295,7 @@ service_callback(int sock, const struct sockaddr* from, size_t addrlen, mdns_ent
 	} else if ((name.length == service->hostname_qualified.length) &&
 	           (strncmp(name.str, service->hostname_qualified.str, name.length) == 0)) {
 		if (((rtype == MDNS_RECORDTYPE_A) || (rtype == MDNS_RECORDTYPE_ANY)) &&
-		    (service->address_ipv4.sin_family == AF_INET)) {
+		    (intf->ipv4_addr.sin_family == AF_INET)) {
 			// The A query was for our qualified hostname (typically "<hostname>.local.") and we
 			// have an IPv4 address, answer with an A record mappiing the hostname to an IPv4
 			// address, as well as any IPv6 address for the hostname, and two test TXT records
@@ -272,14 +306,11 @@ service_callback(int sock, const struct sockaddr* from, size_t addrlen, mdns_ent
 			mdns_record_t additional[5] = {0};
 			size_t additional_count = 0;
 
-			// AAAA record mapping "<hostname>.local." to IPv6 addresses
-			if (service->address_ipv6.sin6_family == AF_INET6)
-				additional[additional_count++] = service->record_aaaa;
-
-			// Add two test TXT records for our service instance name, will be coalesced into
-			// one record with both key-value pair strings by the library
-			additional[additional_count++] = service->txt_record[0];
-			additional[additional_count++] = service->txt_record[1];
+			// A record mapping "<hostname>.local." to IPv4 addresses
+			if (intf->ipv4_addr.sin_family == AF_INET) {
+                service->record_a.data.a.addr = intf->ipv4_addr;
+				additional[additional_count++] = service->record_a;
+			}
 
 			// Send the answer, unicast or multicast depending on flag in query
 			uint16_t unicast = (rclass & MDNS_UNICAST_RESPONSE);
@@ -298,7 +329,7 @@ service_callback(int sock, const struct sockaddr* from, size_t addrlen, mdns_ent
 				                            additional, additional_count);
 			}
 		} else if (((rtype == MDNS_RECORDTYPE_AAAA) || (rtype == MDNS_RECORDTYPE_ANY)) &&
-		           (service->address_ipv6.sin6_family == AF_INET6)) {
+		           (intf->ipv6_addr.sin6_family == AF_INET6)) {
 			// The AAAA query was for our qualified hostname (typically "<hostname>.local.") and we
 			// have an IPv6 address, answer with an AAAA record mappiing the hostname to an IPv6
 			// address, as well as any IPv4 address for the hostname, and two test TXT records
@@ -309,14 +340,11 @@ service_callback(int sock, const struct sockaddr* from, size_t addrlen, mdns_ent
 			mdns_record_t additional[5] = {0};
 			size_t additional_count = 0;
 
-			// A record mapping "<hostname>.local." to IPv4 addresses
-			if (service->address_ipv4.sin_family == AF_INET)
-				additional[additional_count++] = service->record_a;
-
-			// Add two test TXT records for our service instance name, will be coalesced into
-			// one record with both key-value pair strings by the library
-			additional[additional_count++] = service->txt_record[0];
-			additional[additional_count++] = service->txt_record[1];
+			// AAAA record mapping "<hostname>.local." to IPv6 addresses
+			if (intf->ipv6_addr.sin6_family == AF_INET6) {
+                service->record_aaaa.data.aaaa.addr = intf->ipv6_addr;
+				additional[additional_count++] = service->record_aaaa;
+			}
 
 			// Send the answer, unicast or multicast depending on flag in query
 			uint16_t unicast = (rclass & MDNS_UNICAST_RESPONSE);
@@ -343,10 +371,11 @@ service_callback(int sock, const struct sockaddr* from, size_t addrlen, mdns_ent
 
 // Open sockets for sending one-shot multicast queries from an ephemeral port
 static int
-open_client_sockets(int* sockets, int max_sockets, int port) {
+open_client_sockets(service_t *service, int* sockets, int max_sockets, int port) {
 	// When sending, each socket can only send to one network interface
 	// Thus we need to open one socket for each interface and address family
 	int num_sockets = 0;
+	interface_t *new_intf;
 
 #ifdef _WIN32
 
@@ -379,14 +408,18 @@ open_client_sockets(int* sockets, int max_sockets, int port) {
 		if (adapter->OperStatus != IfOperStatusUp)
 			continue;
 
+        new_intf = (interface_t *)malloc(sizeof(*new_intf));
+        if (NULL == new_intf) {
+            continue;
+        }
+        memset((void *)new_intf, 0x00, sizeof(*new_intf));
 		for (IP_ADAPTER_UNICAST_ADDRESS* unicast = adapter->FirstUnicastAddress; unicast;
 		     unicast = unicast->Next) {
 			if (unicast->Address.lpSockaddr->sa_family == AF_INET) {
 				struct sockaddr_in* saddr = (struct sockaddr_in*)unicast->Address.lpSockaddr;
                 int log_addr = 1;
-                service_address_ipv4[count_ipv4] = saddr->sin_addr;
-                ConvertLengthToIpv4Mask(unicast->OnLinkPrefixLength, service_mask_ipv4 + count_ipv4);
-                count_ipv4++;
+                new_intf->ipv4_addr = *saddr;
+                ConvertLengthToIpv4Mask(unicast->OnLinkPrefixLength, (PULONG)&new_intf->ipv4_mask);
                 if (num_sockets < max_sockets) {
                     saddr->sin_port = htons((unsigned short)port);
                     int sock = mdns_socket_open_ipv4(saddr);
@@ -413,9 +446,8 @@ open_client_sockets(int* sockets, int max_sockets, int port) {
 				    memcmp(saddr->sin6_addr.s6_addr, localhost, 16) &&
 				    memcmp(saddr->sin6_addr.s6_addr, localhost_mapped, 16)) {
 					int log_addr = 1;
-                    service_address_ipv6[count_ipv6] = saddr->sin6_addr;
-                    //ConvertLengthToIpv4Mask(unicast->OnLinkPrefixLength, service_mask_ipv6 + count_ipv6);
-                    count_ipv6++;
+                    new_intf->ipv6_addr = *saddr;
+                    //ConvertLengthToIpv4Mask(unicast->OnLinkPrefixLength, &new_intf->ipv6_mask);
 					if (num_sockets < max_sockets) {
 						saddr->sin6_port = htons((unsigned short)port);
 						int sock = mdns_socket_open_ipv6(saddr);
@@ -435,6 +467,8 @@ open_client_sockets(int* sockets, int max_sockets, int port) {
 				}
 			}
 		}
+
+		mdns_intf_append(service, new_intf);
 	}
 
 	free(adapter_address);
@@ -453,12 +487,16 @@ open_client_sockets(int* sockets, int max_sockets, int port) {
 		if (!ifa->ifa_addr)
 			continue;
 
+        new_intf = (interface_t *)malloc(*new_intf);
+        if (NULL == new_intf) {
+            continue;
+        }
+        memset((void *)new_intf, 0x00, sizeof(*new_intf));
 		if (ifa->ifa_addr->sa_family == AF_INET) {
 			struct sockaddr_in* saddr = (struct sockaddr_in*)ifa->ifa_addr;
             int log_addr = 1;
-            service_address_ipv4[count_ipv4] = saddr->sin_addr;
+            new_intf->ipv4_addr = *saddr;
             //ConvertLengthToIpv4Mask(unicast->OnLinkPrefixLength, service_mask_ipv4 + count_ipv4);
-            count_ipv4++;
             if (num_sockets < max_sockets) {
                 saddr->sin_port = htons(port);
                 int sock = mdns_socket_open_ipv4(saddr);
@@ -483,10 +521,9 @@ open_client_sockets(int* sockets, int max_sockets, int port) {
 			                                                 0, 0, 0xff, 0xff, 0x7f, 0, 0, 1};
 			if (memcmp(saddr->sin6_addr.s6_addr, localhost, 16) &&
 			    memcmp(saddr->sin6_addr.s6_addr, localhost_mapped, 16)) {
-				int log_addr = 0;
-                service_address_ipv6[count_ipv6] = saddr->sin6_addr;
+				int log_addr = 1;
+                new_intf->ipv6_addr = *saddr;
                 //ConvertLengthToIpv4Mask(unicast->OnLinkPrefixLength, service_mask_ipv6 + count_ipv6);
-                count_ipv6++;
 				if (num_sockets < max_sockets) {
 					saddr->sin6_port = htons(port);
 					int sock = mdns_socket_open_ipv6(saddr);
@@ -516,14 +553,14 @@ open_client_sockets(int* sockets, int max_sockets, int port) {
 
 // Open sockets to listen to incoming mDNS queries on port 5353
 static int
-open_service_sockets(int* sockets, int max_sockets) {
+open_service_sockets(service_t *service, int* sockets, int max_sockets) {
 	// When recieving, each socket can recieve data from all network interfaces
 	// Thus we only need to open one socket for each address family
 	int num_sockets = 0;
 
 	// Call the client socket function to enumerate and get local addresses,
 	// but not open the actual sockets
-	open_client_sockets(0, 0, 0);
+	open_client_sockets(service, 0, 0, 0);
 
 	if (num_sockets < max_sockets) {
 		struct sockaddr_in sock_addr;
@@ -561,100 +598,80 @@ open_service_sockets(int* sockets, int max_sockets) {
 }
 
 // Provide a mDNS service, answering incoming DNS-SD and mDNS queries
-static void mdns_service(void* hostname, const char* service_name, int service_port) {
-	int sockets[32];
-	int num_sockets = open_service_sockets(sockets, sizeof(sockets) / sizeof(sockets[0]));
+static void mdns_service(void* param) {
 	service_t *service = (service_t *)param;
+	void* buffer;
+	size_t capacity = 2048;
+	int sockets[32];
+	char service_instance_buffer[256] = {0};
+	char qualified_hostname_buffer[256] = {0};
+	int num_sockets = open_service_sockets(service, sockets, sizeof(sockets) / sizeof(sockets[0]));
 	if (num_sockets <= 0) {
 		printf("Failed to open any client sockets\n");
-		return -1;
+		return;
 	}
 	printf("Opened %d socket%s for mDNS service\n", num_sockets, num_sockets ? "s" : "");
 
-	printf("Service mDNS: %s:%d\n", service_name, service_port);
-	printf("Hostname: %s\n", hostname);
+	printf("Service mDNS: %.*s:%d\n", MDNS_STRING_FORMAT(service->service), service->port);
+	printf("Hostname: %.*s\n", MDNS_STRING_FORMAT(service->hostname));
 
-	size_t capacity = 2048;
-	void* buffer = malloc(capacity);
-
-	mdns_string_t service_string = (mdns_string_t){service_name, strlen(service_name)};
-	mdns_string_t hostname_string = (mdns_string_t){hostname, strlen(hostname)};
+	buffer = malloc(capacity);
 
 	// Build the service instance "<hostname>.<_service-name>._tcp.local." string
-	char service_instance_buffer[256] = {0};
 	snprintf(service_instance_buffer, sizeof(service_instance_buffer) - 1, "%.*s.%.*s",
-	         MDNS_STRING_FORMAT(hostname_string), MDNS_STRING_FORMAT(service_string));
-	mdns_string_t service_instance_string =
-	    (mdns_string_t){service_instance_buffer, strlen(service_instance_buffer)};
+	         MDNS_STRING_FORMAT(service->hostname), MDNS_STRING_FORMAT(service->service));
 
 	// Build the "<hostname>.local." string
-	char qualified_hostname_buffer[256] = {0};
 	snprintf(qualified_hostname_buffer, sizeof(qualified_hostname_buffer) - 1, "%.*s.local.",
-	         MDNS_STRING_FORMAT(hostname_string));
-	mdns_string_t hostname_qualified_string =
-	    (mdns_string_t){qualified_hostname_buffer, strlen(qualified_hostname_buffer)};
+	         MDNS_STRING_FORMAT(service->hostname));
 
-	service.service_instance = service_instance_string;
-	service.hostname_qualified = hostname_qualified_string;
-	service.address_ipv4.sin_family = AF_INET;
-	service.address_ipv4.sin_addr = service_address_ipv4[0];
-	service.address_ipv6.sin6_family = AF_INET6;
-	service.address_ipv6.sin6_addr = service_address_ipv6[0];
+	service->service_instance.str = service_instance_buffer;
+	service->service_instance.length = strlen(service_instance_buffer);
+	service->hostname_qualified.str = qualified_hostname_buffer;
+	service->hostname_qualified.length = strlen(qualified_hostname_buffer);
 
 	// Setup our mDNS records
 
 	// PTR record reverse mapping "<_service-name>._tcp.local." to
 	// "<hostname>.<_service-name>._tcp.local."
-	service.record_ptr = (mdns_record_t){.name = service.service,
-	                                     .type = MDNS_RECORDTYPE_PTR,
-	                                     .data.ptr.name = service.service_instance};
+	service->record_ptr.name = service->service;
+	service->record_ptr.type = MDNS_RECORDTYPE_PTR;
+	service->record_ptr.data.ptr.name = service->service_instance;
 
 	// SRV record mapping "<hostname>.<_service-name>._tcp.local." to
 	// "<hostname>.local." with port. Set weight & priority to 0.
-	service.record_srv = (mdns_record_t){.name = service.service_instance,
-	                                     .type = MDNS_RECORDTYPE_SRV,
-	                                     .data.srv.name = service.hostname_qualified,
-	                                     .data.srv.port = service.port,
-	                                     .data.srv.priority = 0,
-	                                     .data.srv.weight = 0};
+	service->record_srv.name = service->service_instance;
+	service->record_srv.type = MDNS_RECORDTYPE_SRV;
+	service->record_srv.data.srv.name = service->hostname_qualified;
+	service->record_srv.data.srv.port = service->port;
+	service->record_srv.data.srv.priority = 0;
+	service->record_srv.data.srv.weight = 0;
 
 	// A/AAAA records mapping "<hostname>.local." to IPv4/IPv6 addresses
-	service.record_a = (mdns_record_t){.name = service.hostname_qualified,
-	                                   .type = MDNS_RECORDTYPE_A,
-	                                   .data.a.addr = service.address_ipv4};
+	service->record_a.name = service->hostname_qualified;
+	service->record_a.type = MDNS_RECORDTYPE_A;
+	//service->record_a.data.a.addr = service->address_ipv4;
 
-	service.record_aaaa = (mdns_record_t){.name = service.hostname_qualified,
-	                                      .type = MDNS_RECORDTYPE_AAAA,
-	                                      .data.aaaa.addr = service.address_ipv6};
-
-	// Add two test TXT records for our service instance name, will be coalesced into
-	// one record with both key-value pair strings by the library
-	service.txt_record[0] = (mdns_record_t){.name = service.service_instance,
-	                                        .type = MDNS_RECORDTYPE_TXT,
-	                                        .data.txt.key = {MDNS_STRING_CONST("test")},
-	                                        .data.txt.value = {MDNS_STRING_CONST("1")}};
-	service.txt_record[1] = (mdns_record_t){.name = service.service_instance,
-	                                        .type = MDNS_RECORDTYPE_TXT,
-	                                        .data.txt.key = {MDNS_STRING_CONST("other")},
-	                                        .data.txt.value = {MDNS_STRING_CONST("value")}};
+	service->record_aaaa.name = service->hostname_qualified;
+	service->record_aaaa.type = MDNS_RECORDTYPE_AAAA;
+	//service->record_aaaa.data.aaaa.addr = service->address_ipv6;
 
 	// Send an announcement on startup of service
+#if (0)
 	{
 		mdns_record_t additional[5] = {0};
 		size_t additional_count = 0;
-		additional[additional_count++] = service.record_srv;
-		if (service.address_ipv4.sin_family == AF_INET)
-			additional[additional_count++] = service.record_a;
-		if (service.address_ipv6.sin6_family == AF_INET6)
-			additional[additional_count++] = service.record_aaaa;
-		additional[additional_count++] = service.txt_record[0];
-		additional[additional_count++] = service.txt_record[1];
+		additional[additional_count++] = service->record_srv;
+		if (service->address_ipv4.sin_family == AF_INET)
+			additional[additional_count++] = service->record_a;
+		if (service->address_ipv6.sin6_family == AF_INET6)
+			additional[additional_count++] = service->record_aaaa;
 
 		for (int isock = 0; isock < num_sockets; ++isock)
-			mdns_announce_multicast(sockets[isock], buffer, capacity, service.record_ptr, 0, 0,
+			mdns_announce_multicast(sockets[isock], buffer, capacity, service->record_ptr, 0, 0,
 			                        additional, additional_count);
 	}
-
+#endif
 	// This is a crude implementation that checks for incoming queries
 	while (1) {
 		int nfds = 0;
@@ -670,7 +687,7 @@ static void mdns_service(void* hostname, const char* service_name, int service_p
 			for (int isock = 0; isock < num_sockets; ++isock) {
 				if (FD_ISSET(sockets[isock], &readfs)) {
 					mdns_socket_listen(sockets[isock], buffer, capacity, service_callback,
-					                   &service);
+					                   service);
 				}
 				FD_SET(sockets[isock], &readfs);
 			}
@@ -680,13 +697,12 @@ static void mdns_service(void* hostname, const char* service_name, int service_p
 	}
 
 	free(buffer);
-	free(service_name_buffer);
 
 	for (int isock = 0; isock < num_sockets; ++isock)
 		mdns_socket_close(sockets[isock]);
 	printf("Closed socket%s\n", num_sockets ? "s" : "");
 
-	return 0;
+	return;
 }
 
 #if defined(_WIN32)
@@ -718,7 +734,7 @@ int slim_thread_create(slim_thread *thread, slim_thread_info *info) {
 
     hThread = (HANDLE)_beginthreadex(NULL, info->stack_size, (unsigned(__stdcall *)(void *))info->function, info->arg, 0, &threadID);
     if (NULL == hThread) {
-        UHTTP_DEBUG("create thread failed\n");
+        printf("create thread failed\n");
         return -1;
     }
 
@@ -760,14 +776,14 @@ int main(int argc, char *argv[]) {
     slim_thread      tid;
     int              result;
     int mode = 0;
+    char *svcbuffer;
     const char* svcname = "iot.local.";
     const char* hostname = "product.eddid.com";
     int query_record = MDNS_RECORDTYPE_PTR;
     int service_port = 42424;
-	service_t service = {0};
+	service_t service;
 
 #ifdef _WIN32
-
     WORD versionWanted = MAKEWORD(1, 1);
     WSADATA wsaData;
     if (WSAStartup(versionWanted, &wsaData)) {
@@ -813,22 +829,23 @@ int main(int argc, char *argv[]) {
 		}
 	}
 
-	service.service = service_string;
-	service.hostname = hostname_string;
-	service.port = service_port;
-	size_t service_name_length = strlen(service_name);
-	if (!service_name_length) {
+    memset((void *)&service, 0x00, sizeof(service));
+	service.service.length = strlen(svcname);
+	if (!service.service.length) {
 		printf("Invalid service name\n");
 		return -1;
 	}
 
-	char* service_name_buffer = malloc(service_name_length + 2);
-	memcpy(service_name_buffer, service_name, service_name_length);
-	if (service_name_buffer[service_name_length - 1] != '.')
-		service_name_buffer[service_name_length++] = '.';
-	service_name_buffer[service_name_length] = 0;
-	service_name = service_name_buffer;
+	svcbuffer = malloc(service.service.length + 2);
+	memcpy(svcbuffer, svcname, service.service.length);
+	if (svcbuffer[service.service.length - 1] != '.')
+		svcbuffer[service.service.length++] = '.';
+	svcbuffer[service.service.length] = 0;
+	service.service.str = svcbuffer;
 
+	service.hostname.str = hostname;
+	service.hostname.length = strlen(hostname);
+	service.port = service_port;
 
     memset((void *)&thread_info, 0x0, sizeof(thread_info));
     thread_info.priority   = 1;
