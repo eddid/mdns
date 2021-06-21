@@ -561,28 +561,15 @@ open_service_sockets(int* sockets, int max_sockets) {
 }
 
 // Provide a mDNS service, answering incoming DNS-SD and mDNS queries
-static int
-service_mdns(const char* hostname, const char* service_name, int service_port) {
+static void mdns_service(void* hostname, const char* service_name, int service_port) {
 	int sockets[32];
 	int num_sockets = open_service_sockets(sockets, sizeof(sockets) / sizeof(sockets[0]));
+	service_t *service = (service_t *)param;
 	if (num_sockets <= 0) {
 		printf("Failed to open any client sockets\n");
 		return -1;
 	}
 	printf("Opened %d socket%s for mDNS service\n", num_sockets, num_sockets ? "s" : "");
-
-	size_t service_name_length = strlen(service_name);
-	if (!service_name_length) {
-		printf("Invalid service name\n");
-		return -1;
-	}
-
-	char* service_name_buffer = malloc(service_name_length + 2);
-	memcpy(service_name_buffer, service_name, service_name_length);
-	if (service_name_buffer[service_name_length - 1] != '.')
-		service_name_buffer[service_name_length++] = '.';
-	service_name_buffer[service_name_length] = 0;
-	service_name = service_name_buffer;
 
 	printf("Service mDNS: %s:%d\n", service_name, service_port);
 	printf("Hostname: %s\n", hostname);
@@ -607,16 +594,12 @@ service_mdns(const char* hostname, const char* service_name, int service_port) {
 	mdns_string_t hostname_qualified_string =
 	    (mdns_string_t){qualified_hostname_buffer, strlen(qualified_hostname_buffer)};
 
-	service_t service = {0};
-	service.service = service_string;
-	service.hostname = hostname_string;
 	service.service_instance = service_instance_string;
 	service.hostname_qualified = hostname_qualified_string;
 	service.address_ipv4.sin_family = AF_INET;
 	service.address_ipv4.sin_addr = service_address_ipv4[0];
 	service.address_ipv6.sin6_family = AF_INET6;
 	service.address_ipv6.sin6_addr = service_address_ipv6[0];
-	service.port = service_port;
 
 	// Setup our mDNS records
 
@@ -706,25 +689,94 @@ service_mdns(const char* hostname, const char* service_name, int service_port) {
 	return 0;
 }
 
-int
-main(int argc, const char* const* argv) {
-	int mode = 0;
-	const char* service = "iot.local.";
-	const char* hostname = "product.eddid.com";
-	int query_record = MDNS_RECORDTYPE_PTR;
-	int service_port = 42424;
+#if defined(_WIN32)
+typedef HANDLE slim_thread;
 
-#ifdef _WIN32
+#pragma pack(push,8)
+typedef struct tagTHREADNAME_INFO {
+    DWORD  dwType;     // Must be 0x1000.
+    LPCSTR szName;     // Pointer to name (in user addr space).
+    DWORD  dwThreadID; // Thread ID (-1=caller thread).
+    DWORD  dwFlags;    // Reserved for future use, must be zero.
+} THREADNAME_INFO;
+#pragma pack(pop)
 
-	WORD versionWanted = MAKEWORD(1, 1);
-	WSADATA wsaData;
-	if (WSAStartup(versionWanted, &wsaData)) {
-		printf("Failed to initialize WinSock\n");
-		return -1;
-	}
+typedef struct slim_thread_info {
+    uint8_t     priority;
+    const char *name;
+    void (*function)(void *);
+    void       *arg;
+    void       *stack_ptr;
+    uint32_t    stack_size;
+} slim_thread_info;
+
+int slim_thread_create(slim_thread *thread, slim_thread_info *info) {
+    HANDLE          hThread;
+    unsigned        threadID;
+    THREADNAME_INFO nameInfo;
+    const DWORD     MS_VC_EXCEPTION = 0x406D1388;
+
+    hThread = (HANDLE)_beginthreadex(NULL, info->stack_size, (unsigned(__stdcall *)(void *))info->function, info->arg, 0, &threadID);
+    if (NULL == hThread) {
+        UHTTP_DEBUG("create thread failed\n");
+        return -1;
+    }
+
+    *thread = hThread;
+
+    nameInfo.dwType     = 0x1000;
+    nameInfo.szName     = info->name;
+    nameInfo.dwThreadID = threadID;
+    nameInfo.dwFlags    = 0;
+    __try {
+        RaiseException(MS_VC_EXCEPTION, 0, sizeof(nameInfo) / sizeof(ULONG_PTR), (ULONG_PTR *)&nameInfo);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+    }
+
+    return 0;
+}
+
+int slim_thread_startup(slim_thread *thread) {
+    return 0;
+}
+
+int slim_thread_msleep(uint32_t milliseconds) {
+    Sleep(milliseconds);
+
+    return 0;
+}
 
 #endif
 
+int main(int argc, char *argv[]) {
+    struct timeval tv;
+    fd_set read_set;
+    int timeout_ms = 1000;
+    int length;
+    char buf[256];
+    slim_thread_info thread_info;
+    slim_thread      tid;
+    int              result;
+    int mode = 0;
+    const char* svcname = "iot.local.";
+    const char* hostname = "product.eddid.com";
+    int query_record = MDNS_RECORDTYPE_PTR;
+    int service_port = 42424;
+	service_t service = {0};
+
+#ifdef _WIN32
+
+    WORD versionWanted = MAKEWORD(1, 1);
+    WSADATA wsaData;
+    if (WSAStartup(versionWanted, &wsaData)) {
+        printf("Failed to initialize WinSock\n");
+        return -1;
+    }
+
+#endif
+    
 	for (int iarg = 0; iarg < argc; ++iarg) {
 		if (strcmp(argv[iarg], "--discovery") == 0) {
 			mode = 0;
@@ -732,10 +784,10 @@ main(int argc, const char* const* argv) {
 			mode = 1;
 			++iarg;
 			if (iarg < argc)
-				service = argv[iarg++];
+				svcname = argv[iarg++];
 			if (iarg < argc) {
-				const char* record_name = service;
-				service = argv[iarg++];
+				const char* record_name = svcname;
+				svcname = argv[iarg++];
 				if (strcmp(record_name, "PTR") == 0)
 					query_record = MDNS_RECORDTYPE_PTR;
 				else if (strcmp(record_name, "SRV") == 0)
@@ -749,7 +801,7 @@ main(int argc, const char* const* argv) {
 			mode = 2;
 			++iarg;
 			if (iarg < argc)
-				service = argv[iarg];
+				svcname = argv[iarg];
 		} else if (strcmp(argv[iarg], "--hostname") == 0) {
 			++iarg;
 			if (iarg < argc)
@@ -761,11 +813,60 @@ main(int argc, const char* const* argv) {
 		}
 	}
 
-	service_mdns(hostname, service, service_port);
+	service.service = service_string;
+	service.hostname = hostname_string;
+	service.port = service_port;
+	size_t service_name_length = strlen(service_name);
+	if (!service_name_length) {
+		printf("Invalid service name\n");
+		return -1;
+	}
 
+	char* service_name_buffer = malloc(service_name_length + 2);
+	memcpy(service_name_buffer, service_name, service_name_length);
+	if (service_name_buffer[service_name_length - 1] != '.')
+		service_name_buffer[service_name_length++] = '.';
+	service_name_buffer[service_name_length] = 0;
+	service_name = service_name_buffer;
+
+
+    memset((void *)&thread_info, 0x0, sizeof(thread_info));
+    thread_info.priority   = 1;
+    thread_info.name       = "mdns";
+    thread_info.function   = mdns_service;
+    thread_info.arg        = (void *)&service;
+    thread_info.stack_ptr  = NULL;
+    thread_info.stack_size = 4096;
+    result = slim_thread_create(&tid, &thread_info);
+
+    if (result >= 0) {
+        slim_thread_startup(&tid);
+    }
+
+    while (1) {
+        tv.tv_sec = timeout_ms / 1000;
+        tv.tv_usec = (timeout_ms - tv.tv_sec * 1000) * 1000;
+
+        FD_ZERO(&read_set);
+        FD_SET(STDIN_FILENO, &read_set);
+
+        select(STDIN_FILENO + 1, &read_set, NULL, NULL, &tv);
+        if (!FD_ISSET(STDIN_FILENO, &read_set)) {
+            continue;
+        }
+        length = read(STDIN_FILENO, buf, sizeof(buf) - 1);
+        if (length <= 0) {
+            continue;
+        }
+        buf[length] = '\0';
+        if (0 == memcmp(buf, "exit", 4)) {
+            break;
+        }
+    }
+    
 #ifdef _WIN32
-	WSACleanup();
+    WSACleanup();
 #endif
 
-	return 0;
+    return 0;
 }
