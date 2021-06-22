@@ -11,6 +11,7 @@
 #include <winsock2.h>
 #include <iphlpapi.h>
 #define sleep(x) Sleep(x * 1000)
+#define snprintf _snprintf
 #else
 #include <netdb.h>
 #include <ifaddrs.h>
@@ -58,6 +59,7 @@ typedef struct {
 static mdns_string_t
 ipv4_address_to_string(char* buffer, size_t capacity, const struct sockaddr_in* addr,
                        size_t addrlen) {
+	mdns_string_t str;
 	char host[NI_MAXHOST] = {0};
 	char service[NI_MAXSERV] = {0};
 	int ret = getnameinfo((const struct sockaddr*)addr, (socklen_t)addrlen, host, NI_MAXHOST,
@@ -71,7 +73,6 @@ ipv4_address_to_string(char* buffer, size_t capacity, const struct sockaddr_in* 
 	}
 	if (len >= (int)capacity)
 		len = (int)capacity - 1;
-	mdns_string_t str;
 	str.str = buffer;
 	str.length = len;
 	return str;
@@ -80,6 +81,7 @@ ipv4_address_to_string(char* buffer, size_t capacity, const struct sockaddr_in* 
 static mdns_string_t
 ipv6_address_to_string(char* buffer, size_t capacity, const struct sockaddr_in6* addr,
                        size_t addrlen) {
+	mdns_string_t str;
 	char host[NI_MAXHOST] = {0};
 	char service[NI_MAXSERV] = {0};
 	int ret = getnameinfo((const struct sockaddr*)addr, (socklen_t)addrlen, host, NI_MAXHOST,
@@ -93,7 +95,6 @@ ipv6_address_to_string(char* buffer, size_t capacity, const struct sockaddr_in6*
 	}
 	if (len >= (int)capacity)
 		len = (int)capacity - 1;
-	mdns_string_t str;
 	str.str = buffer;
 	str.length = len;
 	return str;
@@ -113,6 +114,15 @@ static int mdns_intf_append(service_t* service, interface_t *intf) {
     intf->next = service->intf;
     service->intf = intf;
     return 0;
+}
+
+static void mdns_intf_free(interface_t *intf) {
+    interface_t *ptr;
+
+    for (ptr = intf; NULL != ptr;) {
+    	ptr = intf->next;
+    	free(intf);
+    }
 }
 
 static interface_t *mdns_intf_find(service_t* service, const struct sockaddr *addr) {
@@ -155,6 +165,7 @@ service_callback(int sock, const struct sockaddr* from, size_t addrlen, mdns_ent
 	mdns_string_t name = mdns_string_extract(data, size, &offset, namebuffer, sizeof(namebuffer));
 
 	const char* record_name = 0;
+	uint16_t unicast = (rclass & MDNS_UNICAST_RESPONSE);
 
 	(void)sizeof(ttl);
 	if (entry != MDNS_ENTRYTYPE_QUESTION)
@@ -188,11 +199,13 @@ service_callback(int sock, const struct sockaddr* from, size_t addrlen, mdns_ent
 
 			// Answer PTR record reverse mapping "<_service-name>._tcp.local." to
 			// "<hostname>.<_service-name>._tcp.local."
-			mdns_record_t answer = {
-			    .name = name, .type = MDNS_RECORDTYPE_PTR, .data.ptr.name = service->service};
+			mdns_record_t answer;
+
+			answer.name = name;
+			answer.type = MDNS_RECORDTYPE_PTR;
+			answer.data.ptr.name = service->service;
 
 			// Send the answer, unicast or multicast depending on flag in query
-			uint16_t unicast = (rclass & MDNS_UNICAST_RESPONSE);
 			printf("  --> answer %.*s (%s)\n", MDNS_STRING_FORMAT(answer.data.ptr.name),
 			       (unicast ? "unicast" : "multicast"));
 
@@ -237,7 +250,6 @@ service_callback(int sock, const struct sockaddr* from, size_t addrlen, mdns_ent
 			}
 
 			// Send the answer, unicast or multicast depending on flag in query
-			uint16_t unicast = (rclass & MDNS_UNICAST_RESPONSE);
 			printf("  --> answer %.*s (%s)\n",
 			       MDNS_STRING_FORMAT(service->record_ptr.data.ptr.name),
 			       (unicast ? "unicast" : "multicast"));
@@ -278,7 +290,6 @@ service_callback(int sock, const struct sockaddr* from, size_t addrlen, mdns_ent
 			}
 
 			// Send the answer, unicast or multicast depending on flag in query
-			uint16_t unicast = (rclass & MDNS_UNICAST_RESPONSE);
 			printf("  --> answer %.*s port %d (%s)\n",
 			       MDNS_STRING_FORMAT(service->record_srv.data.srv.name), service->port,
 			       (unicast ? "unicast" : "multicast"));
@@ -305,6 +316,7 @@ service_callback(int sock, const struct sockaddr* from, size_t addrlen, mdns_ent
 
 			mdns_record_t additional[5] = {0};
 			size_t additional_count = 0;
+			mdns_string_t addrstr;
 
 			// A record mapping "<hostname>.local." to IPv4 addresses
 			if (intf->ipv4_addr.sin_family == AF_INET) {
@@ -313,8 +325,7 @@ service_callback(int sock, const struct sockaddr* from, size_t addrlen, mdns_ent
 			}
 
 			// Send the answer, unicast or multicast depending on flag in query
-			uint16_t unicast = (rclass & MDNS_UNICAST_RESPONSE);
-			mdns_string_t addrstr = ip_address_to_string(
+			addrstr = ip_address_to_string(
 			    addrbuffer, sizeof(addrbuffer), (struct sockaddr*)&service->record_a.data.a.addr,
 			    sizeof(service->record_a.data.a.addr));
 			printf("  --> answer %.*s IPv4 %.*s (%s)\n", MDNS_STRING_FORMAT(service->record_a.name),
@@ -339,6 +350,7 @@ service_callback(int sock, const struct sockaddr* from, size_t addrlen, mdns_ent
 
 			mdns_record_t additional[5] = {0};
 			size_t additional_count = 0;
+			mdns_string_t addrstr;
 
 			// AAAA record mapping "<hostname>.local." to IPv6 addresses
 			if (intf->ipv6_addr.sin6_family == AF_INET6) {
@@ -347,8 +359,7 @@ service_callback(int sock, const struct sockaddr* from, size_t addrlen, mdns_ent
 			}
 
 			// Send the answer, unicast or multicast depending on flag in query
-			uint16_t unicast = (rclass & MDNS_UNICAST_RESPONSE);
-			mdns_string_t addrstr =
+			addrstr =
 			    ip_address_to_string(addrbuffer, sizeof(addrbuffer),
 			                         (struct sockaddr*)&service->record_aaaa.data.aaaa.addr,
 			                         sizeof(service->record_aaaa.data.aaaa.addr));
@@ -379,12 +390,13 @@ open_client_sockets(service_t *service, int* sockets, int max_sockets, int port)
 
 #ifdef _WIN32
 
-	IP_ADAPTER_ADDRESSES* adapter_address = 0;
+	PIP_ADAPTER_ADDRESSES adapter_address = 0;
+	PIP_ADAPTER_ADDRESSES adapter;
 	ULONG address_size = 8000;
 	unsigned int ret;
 	unsigned int num_retries = 4;
 	do {
-		adapter_address = (IP_ADAPTER_ADDRESSES*)malloc(address_size);
+		adapter_address = (PIP_ADAPTER_ADDRESSES)malloc(address_size);
 		ret = GetAdaptersAddresses(AF_UNSPEC, GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_ANYCAST, 0,
 		                           adapter_address, &address_size);
 		if (ret == ERROR_BUFFER_OVERFLOW) {
@@ -402,7 +414,8 @@ open_client_sockets(service_t *service, int* sockets, int max_sockets, int port)
 		return num_sockets;
 	}
 
-	for (PIP_ADAPTER_ADDRESSES adapter = adapter_address; adapter; adapter = adapter->Next) {
+	for (adapter = adapter_address; adapter; adapter = adapter->Next) {
+		IP_ADAPTER_UNICAST_ADDRESS* unicast;
 		if (adapter->TunnelType == TUNNEL_TYPE_TEREDO)
 			continue;
 		if (adapter->OperStatus != IfOperStatusUp)
@@ -413,16 +426,16 @@ open_client_sockets(service_t *service, int* sockets, int max_sockets, int port)
             continue;
         }
         memset((void *)new_intf, 0x00, sizeof(*new_intf));
-		for (IP_ADAPTER_UNICAST_ADDRESS* unicast = adapter->FirstUnicastAddress; unicast;
-		     unicast = unicast->Next) {
+		for (unicast = adapter->FirstUnicastAddress; unicast; unicast = unicast->Next) {
 			if (unicast->Address.lpSockaddr->sa_family == AF_INET) {
 				struct sockaddr_in* saddr = (struct sockaddr_in*)unicast->Address.lpSockaddr;
                 int log_addr = 1;
                 new_intf->ipv4_addr = *saddr;
                 ConvertLengthToIpv4Mask(unicast->OnLinkPrefixLength, (PULONG)&new_intf->ipv4_mask);
                 if (num_sockets < max_sockets) {
+                    int sock;
                     saddr->sin_port = htons((unsigned short)port);
-                    int sock = mdns_socket_open_ipv4(saddr);
+                    sock = mdns_socket_open_ipv4(saddr);
                     if (sock >= 0) {
                         sockets[num_sockets++] = sock;
                         log_addr = 1;
@@ -449,8 +462,9 @@ open_client_sockets(service_t *service, int* sockets, int max_sockets, int port)
                     new_intf->ipv6_addr = *saddr;
                     //ConvertLengthToIpv4Mask(unicast->OnLinkPrefixLength, &new_intf->ipv6_mask);
 					if (num_sockets < max_sockets) {
+                    	int sock;
 						saddr->sin6_port = htons((unsigned short)port);
-						int sock = mdns_socket_open_ipv6(saddr);
+						sock = mdns_socket_open_ipv6(saddr);
 						if (sock >= 0) {
 							sockets[num_sockets++] = sock;
 							log_addr = 1;
@@ -498,8 +512,9 @@ open_client_sockets(service_t *service, int* sockets, int max_sockets, int port)
             new_intf->ipv4_addr = *saddr;
             //ConvertLengthToIpv4Mask(unicast->OnLinkPrefixLength, service_mask_ipv4 + count_ipv4);
             if (num_sockets < max_sockets) {
+                int sock;
                 saddr->sin_port = htons(port);
-                int sock = mdns_socket_open_ipv4(saddr);
+                sock = mdns_socket_open_ipv4(saddr);
                 if (sock >= 0) {
                     sockets[num_sockets++] = sock;
                     log_addr = 1;
@@ -525,8 +540,9 @@ open_client_sockets(service_t *service, int* sockets, int max_sockets, int port)
                 new_intf->ipv6_addr = *saddr;
                 //ConvertLengthToIpv4Mask(unicast->OnLinkPrefixLength, service_mask_ipv6 + count_ipv6);
 				if (num_sockets < max_sockets) {
+                    int sock;
 					saddr->sin6_port = htons(port);
-					int sock = mdns_socket_open_ipv6(saddr);
+					sock = mdns_socket_open_ipv6(saddr);
 					if (sock >= 0) {
 						sockets[num_sockets++] = sock;
 						log_addr = 1;
@@ -557,6 +573,7 @@ open_service_sockets(service_t *service, int* sockets, int max_sockets) {
 	// When recieving, each socket can recieve data from all network interfaces
 	// Thus we only need to open one socket for each address family
 	int num_sockets = 0;
+	int sock;
 
 	// Call the client socket function to enumerate and get local addresses,
 	// but not open the actual sockets
@@ -575,7 +592,7 @@ open_service_sockets(service_t *service, int* sockets, int max_sockets) {
 #ifdef __APPLE__
 		sock_addr.sin_len = sizeof(struct sockaddr_in);
 #endif
-		int sock = mdns_socket_open_ipv4(&sock_addr);
+		sock = mdns_socket_open_ipv4(&sock_addr);
 		if (sock >= 0)
 			sockets[num_sockets++] = sock;
 	}
@@ -589,7 +606,7 @@ open_service_sockets(service_t *service, int* sockets, int max_sockets) {
 #ifdef __APPLE__
 		sock_addr.sin6_len = sizeof(struct sockaddr_in6);
 #endif
-		int sock = mdns_socket_open_ipv6(&sock_addr);
+		sock = mdns_socket_open_ipv6(&sock_addr);
 		if (sock >= 0)
 			sockets[num_sockets++] = sock;
 	}
@@ -603,6 +620,7 @@ static void mdns_service(void* param) {
 	void* buffer;
 	size_t capacity = 2048;
 	int sockets[32];
+	int isock;
 	char service_instance_buffer[256] = {0};
 	char qualified_hostname_buffer[256] = {0};
 	int num_sockets = open_service_sockets(service, sockets, sizeof(sockets) / sizeof(sockets[0]));
@@ -677,14 +695,14 @@ static void mdns_service(void* param) {
 		int nfds = 0;
 		fd_set readfs;
 		FD_ZERO(&readfs);
-		for (int isock = 0; isock < num_sockets; ++isock) {
+		for (isock = 0; isock < num_sockets; ++isock) {
 			if (sockets[isock] >= nfds)
 				nfds = sockets[isock] + 1;
 			FD_SET(sockets[isock], &readfs);
 		}
 
 		if (select(nfds, &readfs, 0, 0, 0) >= 0) {
-			for (int isock = 0; isock < num_sockets; ++isock) {
+			for (isock = 0; isock < num_sockets; ++isock) {
 				if (FD_ISSET(sockets[isock], &readfs)) {
 					mdns_socket_listen(sockets[isock], buffer, capacity, service_callback,
 					                   service);
@@ -698,7 +716,7 @@ static void mdns_service(void* param) {
 
 	free(buffer);
 
-	for (int isock = 0; isock < num_sockets; ++isock)
+	for (isock = 0; isock < num_sockets; ++isock)
 		mdns_socket_close(sockets[isock]);
 	printf("Closed socket%s\n", num_sockets ? "s" : "");
 
@@ -775,10 +793,11 @@ int main(int argc, char *argv[]) {
     slim_thread_info thread_info;
     slim_thread      tid;
     int              result;
+	int iarg;
     int mode = 0;
     char *svcbuffer;
     const char* svcname = "iot.local.";
-    const char* hostname = "product.eddid.com";
+    const char* hostname = "product";
     int query_record = MDNS_RECORDTYPE_PTR;
     int service_port = 42424;
 	service_t service;
@@ -793,7 +812,7 @@ int main(int argc, char *argv[]) {
 
 #endif
     
-	for (int iarg = 0; iarg < argc; ++iarg) {
+	for (iarg = 0; iarg < argc; ++iarg) {
 		if (strcmp(argv[iarg], "--discovery") == 0) {
 			mode = 0;
 		} else if (strcmp(argv[iarg], "--query") == 0) {
