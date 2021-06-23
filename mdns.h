@@ -49,7 +49,7 @@ extern "C" {
 #define MDNS_CACHE_FLUSH 0x8000U
 #define MDNS_MAX_SUBSTRINGS 64
 
-enum mdns_record_type {
+typedef enum mdns_record_type {
 	MDNS_RECORDTYPE_IGNORE = 0,
 	// Address
 	MDNS_RECORDTYPE_A = 1,
@@ -63,37 +63,22 @@ enum mdns_record_type {
 	MDNS_RECORDTYPE_SRV = 33,
 	// Any available records
 	MDNS_RECORDTYPE_ANY = 255
-};
+} mdns_record_type_t;
 
-enum mdns_entry_type {
+typedef enum mdns_entry_type {
 	MDNS_ENTRYTYPE_QUESTION = 0,
 	MDNS_ENTRYTYPE_ANSWER = 1,
 	MDNS_ENTRYTYPE_AUTHORITY = 2,
 	MDNS_ENTRYTYPE_ADDITIONAL = 3
-};
+} mdns_entry_type_t;
 
-enum mdns_class { MDNS_CLASS_IN = 1 };
-
-typedef enum mdns_record_type mdns_record_type_t;
-typedef enum mdns_entry_type mdns_entry_type_t;
-typedef enum mdns_class mdns_class_t;
+typedef enum mdns_class { MDNS_CLASS_IN = 1 } mdns_class_t;
 
 typedef int (*mdns_record_callback_fn)(int sock, const struct sockaddr* from, size_t addrlen,
                                        mdns_entry_type_t entry, uint16_t query_id, uint16_t rtype,
                                        uint16_t rclass, uint32_t ttl, const void* data, size_t size,
                                        size_t name_offset, size_t name_length, size_t record_offset,
                                        size_t record_length, void* user_data);
-
-typedef struct mdns_string_t mdns_string_t;
-typedef struct mdns_string_pair_t mdns_string_pair_t;
-typedef struct mdns_string_table_item_t mdns_string_table_item_t;
-typedef struct mdns_string_table_t mdns_string_table_t;
-typedef struct mdns_record_t mdns_record_t;
-typedef struct mdns_record_srv_t mdns_record_srv_t;
-typedef struct mdns_record_ptr_t mdns_record_ptr_t;
-typedef struct mdns_record_a_t mdns_record_a_t;
-typedef struct mdns_record_aaaa_t mdns_record_aaaa_t;
-typedef struct mdns_record_txt_t mdns_record_txt_t;
 
 #ifdef _WIN32
 typedef int mdns_size_t;
@@ -103,48 +88,48 @@ typedef size_t mdns_size_t;
 typedef ssize_t mdns_ssize_t;
 #endif
 
-struct mdns_string_t {
+typedef struct mdns_string_t {
 	const char* str;
 	size_t length;
-};
+} mdns_string_t;
 
-struct mdns_string_pair_t {
+typedef struct mdns_string_pair_t {
 	size_t offset;
 	size_t length;
 	int ref;
-};
+} mdns_string_pair_t;
 
-struct mdns_string_table_t {
+typedef struct mdns_string_table_t {
 	size_t offset[16];
 	size_t count;
 	size_t next;
-};
+} mdns_string_table_t;
 
-struct mdns_record_srv_t {
+typedef struct mdns_record_srv_t {
 	uint16_t priority;
 	uint16_t weight;
 	uint16_t port;
 	mdns_string_t name;
-};
+} mdns_record_srv_t;
 
-struct mdns_record_ptr_t {
+typedef struct mdns_record_ptr_t {
 	mdns_string_t name;
-};
+} mdns_record_ptr_t;
 
-struct mdns_record_a_t {
+typedef struct mdns_record_a_t {
 	struct sockaddr_in addr;
-};
+} mdns_record_a_t;
 
-struct mdns_record_aaaa_t {
+typedef struct mdns_record_aaaa_t {
 	struct sockaddr_in6 addr;
-};
+} mdns_record_aaaa_t;
 
-struct mdns_record_txt_t {
+typedef struct mdns_record_txt_t {
 	mdns_string_t key;
 	mdns_string_t value;
-};
+} mdns_record_txt_t;
 
-struct mdns_record_t {
+typedef struct mdns_record_t {
 	mdns_string_t name;
 	mdns_record_type_t type;
 	union mdns_record_data {
@@ -154,7 +139,7 @@ struct mdns_record_t {
 		mdns_record_aaaa_t aaaa;
 		mdns_record_txt_t txt;
 	} data;
-};
+} mdns_record_t;
 
 struct mdns_header_t {
 	uint16_t query_id;
