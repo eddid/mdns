@@ -1,6 +1,8 @@
 
 #ifdef _WIN32
 #define _CRT_SECURE_NO_WARNINGS 1
+#else
+#define _GNU_SOURCE
 #endif
 
 #include <stdio.h>
@@ -10,27 +12,213 @@
 #ifdef _WIN32
 #include <winsock2.h>
 #include <iphlpapi.h>
-#define sleep(x) Sleep(x * 1000)
 #define snprintf _snprintf
 #else
 #include <netdb.h>
 #include <ifaddrs.h>
 #endif
 
+#include "mdns.h"
+
 #ifndef STDIN_FILENO
 #define STDIN_FILENO 0
 #endif
 
-// Alias some things to simulate recieving data to fuzz library
-#if defined(MDNS_FUZZING)
-#define recvfrom(sock, buffer, capacity, flags, src_addr, addrlen) ((mdns_ssize_t)capacity)
-#define printf
+typedef struct slim_thread_info {
+	uint8_t	 priority;
+	const char *name;
+	void (*function)(void *);
+	void	   *arg;
+	void	   *stack_ptr;
+	uint32_t	stack_size;
+} slim_thread_info;
+
+#if defined(_WIN32)
+typedef HANDLE slim_thread;
+typedef HANDLE slim_mutex;
+
+#pragma pack(push,8)
+typedef struct tagTHREADNAME_INFO {
+	DWORD  dwType;	 // Must be 0x1000.
+	LPCSTR szName;	 // Pointer to name (in user addr space).
+	DWORD  dwThreadID; // Thread ID (-1=caller thread).
+	DWORD  dwFlags;	// Reserved for future use, must be zero.
+} THREADNAME_INFO;
+#pragma pack(pop)
+
+int slim_thread_create(slim_thread *thread, slim_thread_info *info) {
+	HANDLE		  hThread;
+	unsigned		threadID;
+	THREADNAME_INFO nameInfo;
+	const DWORD	 MS_VC_EXCEPTION = 0x406D1388;
+
+	hThread = (HANDLE)_beginthreadex(NULL, info->stack_size, (unsigned(__stdcall *)(void *))info->function, info->arg, 0, &threadID);
+	if (NULL == hThread) {
+		printf("create thread failed\n");
+		return -1;
+	}
+
+	*thread = hThread;
+
+	nameInfo.dwType	 = 0x1000;
+	nameInfo.szName	 = info->name;
+	nameInfo.dwThreadID = threadID;
+	nameInfo.dwFlags	= 0;
+	__try {
+		RaiseException(MS_VC_EXCEPTION, 0, sizeof(nameInfo) / sizeof(ULONG_PTR), (ULONG_PTR *)&nameInfo);
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER)
+	{
+	}
+
+	return 0;
+}
+
+int slim_thread_startup(slim_thread *thread) {
+	return 0;
+}
+
+int slim_mutex_create(slim_mutex *mutex, const char *name) {
+    *mutex = CreateMutex(NULL, FALSE, NULL);
+
+    return (*mutex) ? 0 : -1;
+}
+
+int slim_mutex_lock(slim_mutex *mutex, uint32_t timeout_ms) {
+    WaitForSingleObject(*mutex, timeout_ms);
+
+    return 0;
+}
+
+int slim_mutex_unlock(slim_mutex *mutex) {
+    ReleaseMutex(*mutex);
+
+    return 0;
+}
+
+int slim_mutex_destroy(slim_mutex *mutex) {
+    CloseHandle(*mutex);
+    *mutex = NULL;
+
+    return 0;
+}
+#else
+#include <pthread.h>
+typedef pthread_t slim_thread;
+typedef pthread_mutex_t slim_mutex;
+
+int slim_thread_create(slim_thread *thread, slim_thread_info *info) {
+    pthread_attr_t attr;
+    int            result;
+
+    if ((NULL == thread) || (NULL == info)) {
+        printf("%s thread=%p,info=%p\n", __FUNCTION__, thread, info);
+        return -1;
+    }
+
+    result = pthread_attr_init(&attr);
+    if (0 != result) {
+        printf("%s init attr failed(%d)\n", __FUNCTION__, result);
+        return result;
+    }
+
+    result = pthread_create(thread, &attr, (void * (*)(void *))info->function, (void *)info->arg);
+    if (0 != result) {
+        printf("%s create thread failed(%d)\n", __FUNCTION__, result);
+        pthread_attr_destroy(&attr);
+        return result;
+    }
+
+#if defined(__linux__)
+    pthread_setname_np(*thread, info->name);
 #endif
 
-#include "mdns.h"
+    pthread_attr_destroy(&attr);
 
-#if defined(MDNS_FUZZING)
-#undef recvfrom
+    return 0;
+}
+
+int slim_thread_startup(slim_thread *thread) {
+    return 0;
+}
+
+int slim_mutex_create(slim_mutex *mutex, const char *name) {
+    int result;
+
+    if (NULL == mutex) {
+        printf("%s mutex=NULL\n", __FUNCTION__);
+        return -1;
+    }
+
+    result = pthread_mutex_init(mutex, NULL);
+    if (0 != result) {
+        printf("%s init mutex failed\n", __FUNCTION__);
+        return -1;
+    }
+
+    return 0;
+}
+
+int slim_mutex_lock(slim_mutex *mutex, uint32_t timeout_ms) {
+    struct timespec abstimeout;
+    int             result;
+
+    if (NULL == mutex) {
+        printf("%s mutex=NULL\n", __FUNCTION__);
+        return -1;
+    }
+
+    if (((uint32_t)-1 != timeout_ms) && (0 != timeout_ms)) {
+        clock_gettime(CLOCK_REALTIME, &abstimeout);
+        abstimeout.tv_sec  += timeout_ms / 1000;
+        abstimeout.tv_nsec += (timeout_ms % 1000) * 1000000;
+
+        if (abstimeout.tv_nsec >= 1000000000) {
+            abstimeout.tv_sec++;
+            abstimeout.tv_nsec -= 1000000000;
+        }
+    }
+
+    if (0 == timeout_ms) {
+        result = pthread_mutex_trylock(mutex);
+    } else if ((uint32_t)-1 != timeout_ms) {
+#if defined(__APPLE__) || defined(__MACH__)
+        result = pthread_mutex_lock(mutex);
+#else
+        result = pthread_mutex_timedlock(mutex, &abstimeout);
+#endif
+    } else {
+        result = pthread_mutex_lock(mutex);
+    }
+
+    if (0 != result) {
+        return -2;
+    }
+
+    return 0;
+}
+
+int slim_mutex_unlock(slim_mutex *mutex) {
+    if (NULL == mutex) {
+        printf("%s mutex=NULL\n", __FUNCTION__);
+        return -1;
+    }
+
+    pthread_mutex_unlock(mutex);
+
+    return 0;
+}
+
+int slim_mutex_destroy(slim_mutex *mutex) {
+    if (NULL == mutex) {
+        printf("%s mutex=NULL\n", __FUNCTION__);
+        return -1;
+    }
+
+    pthread_mutex_destroy(mutex);
+
+    return 0;
+}
 #endif
 
 typedef struct instance_t {
@@ -48,6 +236,7 @@ typedef struct interface_t {
 
 // Data for our service including the mDNS records
 typedef struct {
+    slim_mutex    lock;
 	mdns_string_t service;            //"<service-name>"
 	mdns_string_t hostname;           //"<hostname>"
 	instance_t   *instance;           //"<entry>.<service-name>"
@@ -128,13 +317,13 @@ static int mdns_instance_append(service_t* service, const char *entry, size_t le
 	instance->next = NULL;
 	instance->instance.str = (const char *)(instance + 1);
 	instance->instance.length = length + service->service.length + 1;
-	snprintf((char *)instance->instance.str, length + service->service.length + 2, "%.*s.%.*s", length, entry, MDNS_STRING_FORMAT(service->service));
+	snprintf((char *)instance->instance.str, length + service->service.length + 2, "%.*s.%.*s", (int)length, entry, MDNS_STRING_FORMAT(service->service));
 
 	//append to list
-	//TODO: lock
+	slim_mutex_lock(&service->lock, (uint32_t)-1);
 	instance->next = service->instance;
 	service->instance = instance;
-	//TODO: unlock
+	slim_mutex_unlock(&service->lock);
 
 	return 0;
 }
@@ -155,7 +344,7 @@ static instance_t *mdns_instance_find(service_t* service, const char *name, size
 		return NULL;
 	}
 
-	//TODO: lock
+	slim_mutex_lock(&service->lock, (uint32_t)-1);
 	for (ptr = service->instance; NULL != ptr; ptr = ptr->next) {
 		if (ptr->instance.length != length) {
 			continue;
@@ -164,7 +353,7 @@ static instance_t *mdns_instance_find(service_t* service, const char *name, size
 			break;
 		}
 	}
-	//TODO: unlock
+	slim_mutex_unlock(&service->lock);
 
 	return ptr;
 }
@@ -208,8 +397,7 @@ static interface_t *mdns_intf_find(service_t* service, const struct sockaddr *ad
 }
 
 // Callback handling parsing answers to queries sent
-static int
-query_callback(int sock, const struct sockaddr* from, size_t addrlen, mdns_entry_type_t entry,
+static int mdns_query_callback(int sock, const struct sockaddr* from, size_t addrlen, mdns_entry_type_t entry,
                uint16_t query_id, uint16_t rtype, uint16_t rclass, uint32_t ttl, const void* data,
                size_t size, size_t name_offset, size_t name_length, size_t record_offset,
                size_t record_length, void* user_data) {
@@ -278,8 +466,7 @@ query_callback(int sock, const struct sockaddr* from, size_t addrlen, mdns_entry
 }
 
 // Callback handling questions incoming on service sockets
-static int
-service_callback(int sock, const struct sockaddr* from, size_t addrlen, mdns_entry_type_t entry,
+static int mdns_service_callback(int sock, const struct sockaddr* from, size_t addrlen, mdns_entry_type_t entry,
                  uint16_t query_id, uint16_t rtype, uint16_t rclass, uint32_t ttl, const void* data,
                  size_t size, size_t name_offset, size_t name_length, size_t record_offset,
                  size_t record_length, void* user_data) {
@@ -516,8 +703,7 @@ service_callback(int sock, const struct sockaddr* from, size_t addrlen, mdns_ent
 }
 
 // Open sockets for sending one-shot multicast queries from an ephemeral port
-static int
-open_client_sockets(service_t *service, int* sockets, int max_sockets, int port) {
+static int mdns_open_client_sockets(service_t *service, int* sockets, int max_sockets, int port) {
 	// When sending, each socket can only send to one network interface
 	// Thus we need to open one socket for each interface and address family
 	int num_sockets = 0;
@@ -636,7 +822,7 @@ open_client_sockets(service_t *service, int* sockets, int max_sockets, int port)
 		if (!ifa->ifa_addr)
 			continue;
 
-		new_intf = (interface_t *)malloc(*new_intf);
+		new_intf = (interface_t *)malloc(sizeof(*new_intf));
 		if (NULL == new_intf) {
 			continue;
 		}
@@ -703,8 +889,7 @@ open_client_sockets(service_t *service, int* sockets, int max_sockets, int port)
 }
 
 // Open sockets to listen to incoming mDNS queries on port 5353
-static int
-open_service_sockets(service_t *service, int* sockets, int max_sockets) {
+static int mdns_open_service_sockets(service_t *service, int* sockets, int max_sockets) {
 	// When recieving, each socket can recieve data from all network interfaces
 	// Thus we only need to open one socket for each address family
 	int num_sockets = 0;
@@ -712,7 +897,7 @@ open_service_sockets(service_t *service, int* sockets, int max_sockets) {
 
 	// Call the client socket function to enumerate and get local addresses,
 	// but not open the actual sockets
-	open_client_sockets(service, 0, 0, 0);
+	mdns_open_client_sockets(service, 0, 0, 0);
 
 	if (num_sockets < max_sockets) {
 		struct sockaddr_in sock_addr;
@@ -759,7 +944,7 @@ static int mdns_discover(service_t *service) {
 	size_t capacity = 2048;
 	void* user_data = 0;
 	void* buffer;
-	num_sockets = open_client_sockets(service, sockets, sizeof(sockets) / sizeof(sockets[0]), 0);
+	num_sockets = mdns_open_client_sockets(service, sockets, sizeof(sockets) / sizeof(sockets[0]), 0);
 	if (num_sockets <= 0) {
 		printf("Failed to open any client sockets\n");
 		return -1;
@@ -795,7 +980,7 @@ static int mdns_discover(service_t *service) {
 		if (res > 0) {
 			for (isock = 0; isock < num_sockets; ++isock) {
 				if (FD_ISSET(sockets[isock], &readfs)) {
-					records += mdns_discovery_recv(sockets[isock], buffer, capacity, query_callback,
+					records += mdns_discovery_recv(sockets[isock], buffer, capacity, mdns_query_callback,
 												   user_data);
 				}
 			}
@@ -824,7 +1009,7 @@ static int mdns_query(service_t *service, const char* name, int record) {
 	int isock;
 	int res;
 
-	num_sockets = open_client_sockets(service, sockets, sizeof(sockets) / sizeof(sockets[0]), 0);
+	num_sockets = mdns_open_client_sockets(service, sockets, sizeof(sockets) / sizeof(sockets[0]), 0);
 	if (num_sockets <= 0) {
 		printf("Failed to open any client sockets\n");
 		return -1;
@@ -871,7 +1056,7 @@ static int mdns_query(service_t *service, const char* name, int record) {
 		if (res > 0) {
 			for (isock = 0; isock < num_sockets; ++isock) {
 				if (FD_ISSET(sockets[isock], &readfs)) {
-					records += mdns_query_recv(sockets[isock], buffer, capacity, query_callback,
+					records += mdns_query_recv(sockets[isock], buffer, capacity, mdns_query_callback,
 											   user_data, query_id[isock]);
 				}
 				FD_SET(sockets[isock], &readfs);
@@ -895,7 +1080,7 @@ static void mdns_service(void* param) {
 	size_t capacity = 2048;
 	int sockets[32];
 	int isock;
-	int num_sockets = open_service_sockets(service, sockets, sizeof(sockets) / sizeof(sockets[0]));
+	int num_sockets = mdns_open_service_sockets(service, sockets, sizeof(sockets) / sizeof(sockets[0]));
 	if (num_sockets <= 0) {
 		printf("Failed to open any client sockets\n");
 		return;
@@ -963,7 +1148,7 @@ static void mdns_service(void* param) {
 		if (select(nfds, &readfs, 0, 0, 0) >= 0) {
 			for (isock = 0; isock < num_sockets; ++isock) {
 				if (FD_ISSET(sockets[isock], &readfs)) {
-					mdns_socket_listen(sockets[isock], buffer, capacity, service_callback,
+					mdns_socket_listen(sockets[isock], buffer, capacity, mdns_service_callback,
 									   service);
 				}
 				FD_SET(sockets[isock], &readfs);
@@ -973,7 +1158,7 @@ static void mdns_service(void* param) {
 		}
 	}
 
-	free(buffer);
+	free((void *)buffer);
 
 	for (isock = 0; isock < num_sockets; ++isock)
 		mdns_socket_close(sockets[isock]);
@@ -981,67 +1166,6 @@ static void mdns_service(void* param) {
 
 	return;
 }
-
-#if defined(_WIN32)
-typedef HANDLE slim_thread;
-
-#pragma pack(push,8)
-typedef struct tagTHREADNAME_INFO {
-	DWORD  dwType;	 // Must be 0x1000.
-	LPCSTR szName;	 // Pointer to name (in user addr space).
-	DWORD  dwThreadID; // Thread ID (-1=caller thread).
-	DWORD  dwFlags;	// Reserved for future use, must be zero.
-} THREADNAME_INFO;
-#pragma pack(pop)
-
-typedef struct slim_thread_info {
-	uint8_t	 priority;
-	const char *name;
-	void (*function)(void *);
-	void	   *arg;
-	void	   *stack_ptr;
-	uint32_t	stack_size;
-} slim_thread_info;
-
-int slim_thread_create(slim_thread *thread, slim_thread_info *info) {
-	HANDLE		  hThread;
-	unsigned		threadID;
-	THREADNAME_INFO nameInfo;
-	const DWORD	 MS_VC_EXCEPTION = 0x406D1388;
-
-	hThread = (HANDLE)_beginthreadex(NULL, info->stack_size, (unsigned(__stdcall *)(void *))info->function, info->arg, 0, &threadID);
-	if (NULL == hThread) {
-		printf("create thread failed\n");
-		return -1;
-	}
-
-	*thread = hThread;
-
-	nameInfo.dwType	 = 0x1000;
-	nameInfo.szName	 = info->name;
-	nameInfo.dwThreadID = threadID;
-	nameInfo.dwFlags	= 0;
-	__try {
-		RaiseException(MS_VC_EXCEPTION, 0, sizeof(nameInfo) / sizeof(ULONG_PTR), (ULONG_PTR *)&nameInfo);
-	}
-	__except (EXCEPTION_EXECUTE_HANDLER)
-	{
-	}
-
-	return 0;
-}
-
-int slim_thread_startup(slim_thread *thread) {
-	return 0;
-}
-
-int slim_thread_msleep(uint32_t milliseconds) {
-	Sleep(milliseconds);
-
-	return 0;
-}
-
-#endif
 
 int main(int argc, char *argv[]) {
 	struct timeval tv;
@@ -1121,6 +1245,7 @@ int main(int argc, char *argv[]) {
 
 	memset((void *)&service, 0x00, sizeof(service));
 	service.port = service_port;
+	slim_mutex_create(&service.lock, "mdns_lock");
 
 	// Build the "<service-name>.local." string
 	service.service.length = strlen(svcname);
@@ -1131,7 +1256,7 @@ int main(int argc, char *argv[]) {
 
 	ptr = (char *)malloc(service.service.length + 2);
 	if (!ptr) {
-		printf("Failed malloc(%d) service name\n", service.service.length + 2);
+		printf("Failed malloc(%d) service name\n", (int)service.service.length + 2);
 		return -1;
 	}
 	memcpy(ptr, svcname, service.service.length);
@@ -1145,7 +1270,7 @@ int main(int argc, char *argv[]) {
 	service.hostname_qualified.length = service.hostname.length + strlen(".local.");
 	ptr = (char *)malloc(service.hostname_qualified.length + 1);
 	if (!ptr) {
-		printf("Failed malloc(%d) host name\n", service.hostname_qualified.length + 1);
+		printf("Failed malloc(%d) host name\n", (int)service.hostname_qualified.length + 1);
 		return -1;
 	}
 	snprintf(ptr, service.hostname_qualified.length + 1, "%s.local.", hostname);
@@ -1229,9 +1354,9 @@ int main(int argc, char *argv[]) {
 	service.intf = NULL;
 	mdns_instance_free(service.instance);
 	service.instance = NULL;
-	free(service.hostname.str);
+	free((void *)service.hostname.str);
 	service.hostname.str = NULL;
-	free(service.service.str);
+	free((void *)service.service.str);
 	service.service.str = NULL;
 	
 #ifdef _WIN32
